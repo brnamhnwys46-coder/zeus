@@ -1,0 +1,6 @@
+{
+  "name": "Cloudflare Multi-Worker Architect Suite",
+  "description": "Production-grade distributed 4-Worker architecture refactor for Cloudflare Workers proxy panels with Secret Route Gate and dynamic D1/KV endpoints.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

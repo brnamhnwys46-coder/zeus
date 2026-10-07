@@ -1,0 +1,17 @@
+name = "worker-b-db"
+main = "worker-b.js"
+compatibility_date = "2026-07-10"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Secret token shared with Worker A and Worker D
+# Can also be set via: wrangler secret put INTERNAL_AUTH_TOKEN
+INTERNAL_AUTH_TOKEN = "zeus-secret-inter-worker-token-change-me"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "zeus-db"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[triggers]
+crons = ["0 * * * *"] # Hourly auto-reset check

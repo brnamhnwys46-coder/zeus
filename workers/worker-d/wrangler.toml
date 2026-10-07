@@ -1,0 +1,15 @@
+name = "worker-d-proxy"
+main = "worker-d.js"
+compatibility_date = "2026-07-10"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Internal token for authenticating calls to Worker B (Database) & Worker C (Cache)
+INTERNAL_AUTH_TOKEN = "zeus-secret-inter-worker-token-change-me"
+
+# Endpoints for Worker B and Worker C (Can be on different Cloudflare accounts)
+DB_SERVICE_URL = "https://worker-b-db.YOUR-ACCOUNT.workers.dev"
+CACHE_SERVICE_URL = "https://worker-c-cache.YOUR-ACCOUNT.workers.dev"
+
+# Optional secret key required on incoming websocket connections
+PROXY_GATE_KEY = ""

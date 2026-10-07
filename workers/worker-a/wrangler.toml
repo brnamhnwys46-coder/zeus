@@ -1,0 +1,31 @@
+name = "worker-a-gateway"
+main = "worker-a.js"
+compatibility_date = "2026-07-10"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Secret Route Gate: Must match path prefix or query parameter to access the panel
+# Example: If set to "ggg", panel is accessible via /ggg/panel or ?gate=ggg
+SECRET_ROUTE_GATE = "ggg"
+
+# Shared internal token for authenticating with Worker B, C, and D
+INTERNAL_AUTH_TOKEN = "zeus-secret-inter-worker-token-change-me"
+
+# Endpoints for Worker B (Database), Worker C (Cache), and Worker D (Proxy)
+# Can be on separate Cloudflare Accounts
+DB_SERVICE_URL = "https://worker-b-db.YOUR-ACCOUNT.workers.dev"
+CACHE_SERVICE_URL = "https://worker-c-cache.YOUR-ACCOUNT.workers.dev"
+PROXY_SERVICE_URL = "https://worker-d-proxy.YOUR-ACCOUNT.workers.dev"
+
+# Optional: If deployed within the SAME Cloudflare account, you can also use Service Bindings:
+# [[services]]
+# binding = "DB_SERVICE"
+# service = "worker-b-db"
+#
+# [[services]]
+# binding = "CACHE_SERVICE"
+# service = "worker-c-cache"
+#
+# [[services]]
+# binding = "PROXY_SERVICE"
+# service = "worker-d-proxy"
