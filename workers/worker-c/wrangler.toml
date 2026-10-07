@@ -8,7 +8,7 @@ compatibility_flags = ["nodejs_compat"]
 #   wrangler secret put INTERNAL_AUTH_TOKEN
 [vars]
 ENVIRONMENT = "production"
-UPSTREAM_MIRRORS = "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main,https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev"
+UPSTREAM_MIRRORS = "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main"
 
 [[kv_namespaces]]
 binding = "FILE_CACHE_KV"

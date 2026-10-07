@@ -6,13 +6,13 @@ import { connect } from "cloudflare:sockets";
  * Handles:
  * - External file caching (ips.txt, vip-list, proxy_vip/*.txt, proxy/*.txt)
  * - Cloudflare KV storage (FILE_CACHE_KV) with memory cache acceleration
- * - Upstream mirrors with automatic fallback (GitHub, Workers mirrors)
- * - Offloaded outbound proxy socket health testing
+ * - Upstream mirrors configured strictly via UPSTREAM_MIRRORS (no hard-coded mirrors)
+ * - Outbound proxy health testing offloaded from the panel
  * 
  * Security:
  * - Fails closed if INTERNAL_AUTH_TOKEN is missing or invalid.
  * - Constant-time token verification.
- * - Server-side only; does not expose internal endpoints to the browser.
+ * - Public /health check; authenticated /api/internal/health.
  */
 
 const MEMORY_CACHE = new Map();
@@ -60,9 +60,12 @@ function verifyInternalAuth(request, env) {
   return timingSafeEqual(providedToken, expectedToken.trim());
 }
 
+// Upstream mirrors come EXCLUSIVELY from configuration (env.UPSTREAM_MIRRORS)
 function getUpstreamUrls(filePath, env) {
-  const rawMirrors = env.UPSTREAM_MIRRORS || "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main,https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev";
+  const rawMirrors = env.UPSTREAM_MIRRORS || "";
   const mirrors = rawMirrors.split(",").map(m => m.trim().replace(/\/+$/, "")).filter(Boolean);
+  if (mirrors.length === 0) return [];
+
   const cleanPath = filePath.startsWith("/") ? filePath.slice(1) : filePath;
   const ghPath = cleanPath.includes("?") ? cleanPath.substring(0, cleanPath.indexOf("?")) : cleanPath;
 
@@ -76,6 +79,7 @@ function getUpstreamUrls(filePath, env) {
 
 async function fetchFromUpstream(filePath, env) {
   const urls = getUpstreamUrls(filePath, env);
+  if (urls.length === 0) return null;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -150,7 +154,6 @@ async function getCachedFile(filePath, env, ttlSeconds = 3600) {
   return null;
 }
 
-// Socket helpers for testing proxies
 function bracketIPv6(host) {
   return typeof host === "string" && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
@@ -209,7 +212,7 @@ export default {
     const url = new URL(request.url);
 
     // Public Health Check
-    if (url.pathname === "/health" || url.pathname === "/api/internal/health") {
+    if (url.pathname === "/health") {
       return safeJson({
         status: "healthy",
         service: "worker-c-cache",
@@ -222,6 +225,16 @@ export default {
     // Strict Internal Authentication (FAIL CLOSED)
     if (!verifyInternalAuth(request, env)) {
       return safeJson({ success: false, error: "Forbidden: Invalid or missing internal authentication token." }, 403);
+    }
+
+    // Authenticated Internal Health Check
+    if (url.pathname === "/api/internal/health") {
+      return safeJson({
+        status: "healthy",
+        service: "worker-c-cache",
+        authenticated: true,
+        timestamp: Date.now()
+      });
     }
 
     const path = url.pathname;

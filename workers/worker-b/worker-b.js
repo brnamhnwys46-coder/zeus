@@ -4,11 +4,13 @@
  * Sole owner of Cloudflare D1 database operations.
  * Communicates ONLY with Worker A and Worker D via authenticated internal API calls.
  * 
- * Security:
+ * Security & Reliability:
  * - Fails closed if INTERNAL_AUTH_TOKEN is missing or invalid.
  * - Constant-time comparison for authentication tokens.
  * - Cryptographically random session management.
  * - Safe idempotent schema migrations without dropping tables or losing columns.
+ * - Stores random, revocable per-user subscription and status tokens.
+ * - Never returns password hashes to browser clients.
  */
 
 let schemaEnsured = false;
@@ -36,7 +38,7 @@ function timingSafeEqual(a, b) {
 
 function verifyInternalAuth(request, env) {
   const expectedToken = env.INTERNAL_AUTH_TOKEN;
-  // FAIL CLOSED: if token is missing, undefined, or empty, deny access immediately
+  // FAIL CLOSED: if token is missing or empty, deny access immediately
   if (!expectedToken || typeof expectedToken !== "string" || expectedToken.trim() === "") {
     return false;
   }
@@ -128,11 +130,13 @@ async function ensureSchema(db) {
   if (schemaPromise) { await schemaPromise; return; }
 
   schemaPromise = (async () => {
-    // 1. Ensure primary tables exist
+    // 1. Ensure core tables exist without dropping existing data
     await db.prepare(`CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE,
       uuid TEXT,
+      sub_token TEXT UNIQUE,
+      status_token TEXT UNIQUE,
       limit_gb REAL,
       expiry_days INTEGER,
       ips TEXT,
@@ -163,6 +167,8 @@ async function ensureSchema(db) {
     // Full list of columns required by modern ZEUS schema
     const requiredCols = [
       { name: "uuid", def: "TEXT DEFAULT NULL" },
+      { name: "sub_token", def: "TEXT DEFAULT NULL" },
+      { name: "status_token", def: "TEXT DEFAULT NULL" },
       { name: "limit_gb", def: "REAL DEFAULT NULL" },
       { name: "expiry_days", def: "INTEGER DEFAULT NULL" },
       { name: "limit_req", def: "INTEGER DEFAULT NULL" },
@@ -215,7 +221,7 @@ async function ensureSchema(db) {
       }
     }
 
-    // 3. Backward-compatibility data harmonization (preserves older legacy schemas)
+    // 3. Backward-compatibility data harmonization
     if (existingCols.has("total_gb")) {
       await db.prepare("UPDATE users SET limit_gb = total_gb WHERE limit_gb IS NULL AND total_gb IS NOT NULL").run().catch(() => {});
     }
@@ -223,6 +229,17 @@ async function ensureSchema(db) {
       await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run().catch(() => {});
     }
     await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run().catch(() => {});
+
+    // Ensure every user has a random, revocable sub_token and status_token
+    const tokenlessUsers = await db.prepare("SELECT id FROM users WHERE sub_token IS NULL OR status_token IS NULL").all().catch(() => ({ results: [] }));
+    if (tokenlessUsers && tokenlessUsers.results) {
+      for (const u of tokenlessUsers.results) {
+        const subToken = generateRandomHex(16);
+        const statusToken = generateRandomHex(16);
+        await db.prepare("UPDATE users SET sub_token = COALESCE(sub_token, ?), status_token = COALESCE(status_token, ?) WHERE id = ?")
+          .bind(subToken, statusToken, u.id).run().catch(() => {});
+      }
+    }
 
     // Ensure trojan_hash exists for trojan users
     const unhashedUsers = await db.prepare("SELECT id, uuid FROM users WHERE trojan_hash IS NULL AND uuid IS NOT NULL").all().catch(() => ({ results: [] }));
@@ -263,9 +280,10 @@ export default {
   },
 
   async fetch(request, env, ctx) {
-    // 1. Public Health Check
     const url = new URL(request.url);
-    if (url.pathname === "/health" || url.pathname === "/api/internal/health") {
+
+    // 1. Public Health Check
+    if (url.pathname === "/health") {
       return safeJson({
         status: "healthy",
         service: "worker-b-db",
@@ -276,6 +294,16 @@ export default {
     // 2. Strict Internal Authentication (FAIL CLOSED)
     if (!verifyInternalAuth(request, env)) {
       return safeJson({ success: false, error: "Forbidden: Invalid or missing internal authentication token." }, 403);
+    }
+
+    // Authenticated Internal Health Check
+    if (url.pathname === "/api/internal/health") {
+      return safeJson({
+        status: "healthy",
+        service: "worker-b-db",
+        authenticated: true,
+        timestamp: Date.now()
+      });
     }
 
     if (!env.DB) {
@@ -330,6 +358,9 @@ export default {
           finalUuid = `50414e45-4c5f-5a45-5553-${randomHex}`;
         }
 
+        const subToken = body.sub_token || generateRandomHex(16);
+        const statusToken = body.status_token || generateRandomHex(16);
+
         let finalConnType = "vless";
         if (protocols && Array.isArray(protocols) && protocols.length > 0) finalConnType = protocols.join(",");
         else if (connection_type) finalConnType = connection_type;
@@ -339,15 +370,15 @@ export default {
         const nowTime = Date.now();
 
         await env.DB.prepare(`INSERT INTO users (
-          username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint,
+          username, uuid, sub_token, status_token, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint,
           max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads,
           frag_len, frag_int, advanced_frag, cipher_suites, tls_mask, user_proxy_iata, user_socks5,
           user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time,
           auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy,
           start_on_first_connect, first_connection_time, trojan_hash, enable_direct
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .bind(
-            username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null,
+            username, finalUuid, subToken, statusToken, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null,
             limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls || 'on', port || '443', fingerprint || "chrome",
             ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, parseFloat(used_gb) || 0,
             parseInt(used_req) || 0, created_at || new Date().toISOString(), is_active !== undefined ? parseInt(is_active) : 1,
@@ -360,17 +391,17 @@ export default {
             enable_direct !== undefined ? (enable_direct ? 1 : 0) : 1
           ).run();
 
-        return safeJson({ success: true, uuid: finalUuid, username });
+        return safeJson({ success: true, uuid: finalUuid, username, sub_token: subToken, status_token: statusToken });
       }
 
-      // Single User Lookup (Indexed lookup for Worker D & Worker A status)
+      // Single User Lookup (Indexed lookup by sub_token, status_token, username, uuid, or trojan_hash)
       if (path.startsWith("/api/internal/user/") && request.method === "GET") {
         const lookupKey = decodeURIComponent(path.slice("/api/internal/user/".length));
         if (!lookupKey) return safeJson({ success: false, error: "Missing lookup key" }, 400);
 
         let user = await env.DB.prepare(
-          "SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ? OR trojan_hash = ?"
-        ).bind(lookupKey, lookupKey, lookupKey).first();
+          "SELECT * FROM users WHERE sub_token = ? OR status_token = ? OR username = ? COLLATE NOCASE OR uuid = ? OR trojan_hash = ?"
+        ).bind(lookupKey, lookupKey, lookupKey, lookupKey, lookupKey).first();
 
         if (!user && lookupKey.length === 56) {
           const { results } = await env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
@@ -384,6 +415,17 @@ export default {
 
         if (!user) return safeJson({ success: false, error: "User not found" }, 404);
         return safeJson({ success: true, user });
+      }
+
+      // Revoke and regenerate subscription and status tokens
+      if (path.startsWith("/api/internal/user/") && path.endsWith("/revoke-tokens") && request.method === "POST") {
+        const usernamePart = path.slice("/api/internal/user/".length, path.length - "/revoke-tokens".length);
+        const username = decodeURIComponent(usernamePart);
+        const newSubToken = generateRandomHex(16);
+        const newStatusToken = generateRandomHex(16);
+        await env.DB.prepare("UPDATE users SET sub_token = ?, status_token = ? WHERE username = ?")
+          .bind(newSubToken, newStatusToken, username).run();
+        return safeJson({ success: true, sub_token: newSubToken, status_token: newStatusToken });
       }
 
       // Update User
@@ -560,7 +602,6 @@ export default {
 
         const hashed = await sha256(password || "");
         if (timingSafeEqual(row.value, hashed)) {
-          // Generate new cryptographically random session token
           const sessionToken = generateRandomHex(32);
           const expiresAt = Date.now() + (7 * 24 * 60 * 60 * 1000); // 7 days
           await env.DB.prepare("INSERT INTO sessions (id, expires_at, created_at) VALUES (?, ?, ?)").bind(sessionToken, expiresAt, Date.now()).run();
@@ -579,7 +620,6 @@ export default {
           return safeJson({ valid: true });
         }
 
-        // Clean expired sessions opportunistically
         ctx.waitUntil(env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now).run());
         return safeJson({ valid: false });
       }

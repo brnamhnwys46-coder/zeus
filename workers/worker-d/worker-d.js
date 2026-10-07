@@ -8,7 +8,7 @@ import { connect } from "cloudflare:sockets";
  * - Outbound dialing: Direct TCP sockets (cloudflare:sockets), SOCKS5, SOCKS4, HTTP CONNECT.
  * - DoH DNS tunneling with parental and ad-blocking support.
  * - Full streaming pipeline with BYOB reader, backpressure, and upstream batching.
- * - Owns Subscription Service: /sub/:username, /feed/:username, /yaml/:username.
+ * - Owns Subscription Service: /sub/<random-token>, /feed/<random-token>, /yaml/<random-token>.
  * - Communicates with Worker B for user authentication & traffic flushing.
  * - Communicates with Worker C for clean IPs and VIP proxy repositories.
  * 
@@ -21,19 +21,11 @@ import { connect } from "cloudflare:sockets";
 const GLOBAL_TRAFFIC_CACHE = new Map();
 const ACTIVE_CONNECTIONS_COUNT = new Map();
 const GLOBAL_ACTIVE_IPS = new Map();
-const GLOBAL_LAST_ACTIVE_WRITE = new Map();
-const GLOBAL_LAST_DB_WRITE = new Map();
-const GLOBAL_WRITE_LOCK = new Map();
 const USER_CACHE = new Map();
 const DNS_CACHE = new Map();
-const REPO_FILE_CACHE = new Map();
 
 const DNS_CACHE_TTL = 30 * 60 * 1000;
 const DOH_RESOLVER = "https://cloudflare-dns.com/dns-query";
-const UPSTREAM_BUNDLE_TARGET_BYTES = 512 * 1024;
-const UPSTREAM_QUEUE_MAX_BYTES = 32 * 1024 * 1024;
-const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
-const DNS_CACHE_MAX_ENTRIES = 2048;
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
@@ -271,8 +263,11 @@ function extractUUIDFromvIees(data) {
 }
 
 function isIPv4(value) {
-  const parts = String(value || "").split(".");
-  return parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+  return parts(value);
+  function parts(v) {
+    const p = String(v || "").split(".");
+    return p.length === 4 && p.every(part => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+  }
 }
 
 function parseProxyConfig(proxyStr, defaultPort = 1080) {
@@ -598,9 +593,7 @@ async function handleWebSocketProxy(request, env, ctx) {
   serverSock.accept();
   serverSock.binaryType = "arraybuffer";
 
-  let clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
   let username = null;
-  let validUUID = null;
   let targetDns = "8.8.4.4";
   let uncountedBytes = 0;
   let isClosed = false;
@@ -786,7 +779,6 @@ async function handleWebSocketProxy(request, env, ctx) {
 
     if (!user || user.is_active === 0) { serverSock.close(); return; }
     username = user.username;
-    validUUID = user.uuid;
 
     // Check Volume Limits
     const liveGb = (user.used_gb || 0) + ((GLOBAL_TRAFFIC_CACHE.get(username) || 0) / (1024 * 1024 * 1024));
@@ -850,17 +842,28 @@ async function handleWebSocketProxy(request, env, ctx) {
   return new Response(null, { status: 101, webSocket: clientSock });
 }
 
-// ----------------------------------------------------
-// SUBSCRIPTION SERVICE (Owned exclusively by Worker D)
-// ----------------------------------------------------
+// ---------------------------------------------------------------------
+// SECURE SUBSCRIPTION SERVICE (Random, Revocable Token Authorization)
+// ---------------------------------------------------------------------
 async function handleSubscriptionRequest(url, env) {
   const isYaml = url.pathname.startsWith("/yaml/");
   const offset = isYaml ? 6 : (url.pathname.startsWith("/sub/") ? 5 : 6);
-  const username = decodeURIComponent(url.pathname.slice(offset));
+  const token = decodeURIComponent(url.pathname.slice(offset));
 
-  const dbRes = await callWorkerB(`/api/internal/user/${encodeURIComponent(username)}`, "GET", null, env);
-  if (!dbRes || !dbRes.user) return new Response("Subscription user not found", { status: 404 });
+  if (!token || token.length < 8) {
+    return new Response("Invalid subscription token", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  }
+
+  // Lookup user by sub_token exclusively (prevent username enumeration)
+  const dbRes = await callWorkerB(`/api/internal/user/${encodeURIComponent(token)}`, "GET", null, env);
+  if (!dbRes || !dbRes.user || dbRes.user.sub_token !== token) {
+    return new Response("Subscription not found or revoked", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  }
   const user = dbRes.user;
+
+  if (user.is_active === 0) {
+    return new Response("Subscription inactive", { status: 403, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+  }
 
   // Fetch clean IPs from Worker C
   const ipsRes = await callWorkerC(`/api/internal/cache/ips?operator=${user.ip_operator || 'all'}&count=${user.ip_count || 15}`, "GET", null, env);
@@ -924,8 +927,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Health Endpoint
-    if (url.pathname === "/health" || url.pathname === "/api/internal/health") {
+    // 1. Public Health Endpoint
+    if (url.pathname === "/health") {
       return new Response(JSON.stringify({
         status: "healthy",
         service: "worker-d-proxy",
@@ -933,27 +936,53 @@ export default {
       }), { headers: { "Content-Type": "application/json" } });
     }
 
-    // 2. Subscription URL Lookup API (For Worker A to query)
+    // 2. Authenticated Internal Health Endpoint
+    if (url.pathname === "/api/internal/health") {
+      if (!verifyInternalAuth(request, env)) {
+        return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 403, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({
+        status: "healthy",
+        service: "worker-d-proxy",
+        authenticated: true,
+        timestamp: Date.now()
+      }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // 3. Subscription URL Lookup API (Worker A requests tokenized subscription URLs)
     if (url.pathname === "/api/internal/subscription-url") {
       if (!verifyInternalAuth(request, env)) {
         return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 403, headers: { "Content-Type": "application/json" } });
       }
       const username = url.searchParams.get("username") || "";
+      if (!username) {
+        return new Response(JSON.stringify({ success: false, error: "Username required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+      }
+
+      const dbRes = await callWorkerB(`/api/internal/user/${encodeURIComponent(username)}`, "GET", null, env);
+      if (!dbRes || !dbRes.user) {
+        return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+      }
+
+      const token = dbRes.user.sub_token;
+      const statusToken = dbRes.user.status_token;
       const base = `${url.protocol}//${url.host}`;
       return new Response(JSON.stringify({
         success: true,
-        subscription_url: `${base}/sub/${encodeURIComponent(username)}`,
-        feed_url: `${base}/feed/${encodeURIComponent(username)}`,
-        yaml_url: `${base}/yaml/${encodeURIComponent(username)}`
+        subscription_url: `${base}/sub/${token}`,
+        feed_url: `${base}/feed/${token}`,
+        yaml_url: `${base}/yaml/${token}`,
+        sub_token: token,
+        status_token: statusToken
       }), { headers: { "Content-Type": "application/json" } });
     }
 
-    // 3. Subscription Feeds (Owned by Worker D)
+    // 4. Subscription Feeds (Protected by random sub_token)
     if (url.pathname.startsWith("/sub/") || url.pathname.startsWith("/feed/") || url.pathname.startsWith("/yaml/")) {
       return await handleSubscriptionRequest(url, env);
     }
 
-    // 4. WebSocket Proxy Upgrades
+    // 5. WebSocket Proxy Upgrades
     const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
     if (upgradeHeader === "websocket") {
       return await handleWebSocketProxy(request, env, ctx);
