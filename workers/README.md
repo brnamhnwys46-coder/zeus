@@ -1,179 +1,179 @@
-# Distributed Multi-Worker Architecture for Cloudflare Workers Proxy Panel
+# ZEUS Multi-Worker Architecture Specification & Deployment Manual
 
-This architecture decomposes a monolithic Cloudflare Worker into **4 decoupled, secure, and horizontally scalable Workers** that can be deployed across different Cloudflare accounts.
-
----
-
-## 🏛️ System Topology
-
-```
-                  ┌────────────────────────────────────────┐
-                  │          Client (Browser / App)        │
-                  └───────────────────┬────────────────────┘
-                                      │
-                         [Secret Route Gate /ggg]
-                                      │
-                 ┌────────────────────▼────────────────────┐
-                 │                WORKER A                 │
-                 │          Main Panel & Gateway           │
-                 │   - HTML / UI & Admin Authentication    │
-                 │   - Secret Route Gate Filter (404 Gate) │
-                 │   - Subscriptions Generator (Feed/YAML) │
-                 │   - Dynamic Settings Configuration UI   │
-                 └──────────┬──────────┬───────────┬───────┘
-                            │          │           │
-                 Internal   │          │           │ WebSocket Proxy
-                 RPC / API  │          │           │ Forwarding
-                            │          │           │
-           ┌────────────────┘          │           └─────────────────┐
-           ▼                           ▼                             ▼
-┌─────────────────────┐   ┌──────────────────────┐   ┌───────────────────────┐
-│      WORKER B       │   │       WORKER C       │   │       WORKER D        │
-│  Database Service   │   │ Repository & Cache   │   │ Connection & Proxy    │
-│  (Cloudflare D1)    │   │   (Cloudflare KV)    │   │       Handler         │
-│                     │   │                      │   │                       │
-│ - Users & Settings  │   │ - ips.txt & VIP-list │   │ - Heavy WebSocket TCP │
-│ - Traffic Auditing  │   │ - In-Memory + KV TTL │   │ - VLESS / Trojan / SS │
-│ - Auto Quota Reset  │   │ - Fallback Mirrors   │   │ - Direct Sockets / DOH│
-└─────────────────────┘   └──────────────────────┘   └───────────────────────┘
-```
+Refactored distributed architecture separating the monolithic ZEUS panel into four decoupled services with clear boundaries and fail-closed security.
 
 ---
 
-## 📦 Workers Summary
+## 🏛️ Architecture & Service Boundaries
 
-| Worker | Directory | Primary Role | Cloudflare Bindings |
+```
+                    ┌────────────────────────────────────────┐
+                    │          Client (Browser / App)        │
+                    └───────────────────┬────────────────────┘
+                                        │
+                           [Secret Route Gate /ggg]
+                                        │
+                   ┌────────────────────▼────────────────────┐
+                   │                WORKER A                 │
+                   │          Management Panel ONLY          │
+                   │   - HTML / Persian UI & Admin Auth      │
+                   │   - Cryptographic Random Session Tokens │
+                   │   - Secret Route Gate Filter (404 Gate) │
+                   │   - Displays Worker D Subscription URLs │
+                   │   - Dynamic Admin Settings Panel        │
+                   └──────────┬──────────────────┬───────────┘
+                              │                  │
+                   Internal   │                  │ Internal
+                   RPC / API  │                  │ RPC / API
+                              │                  │
+             ┌────────────────┘                  └──────────────────┐
+             ▼                                                      ▼
+  ┌─────────────────────┐                                ┌──────────────────────┐
+  │      WORKER B       │◄───────────────────────────────┤       WORKER D       │
+  │  Database Service   │  Authenticated User Lookup &   │  Connection & Proxy  │
+  │     (ONLY D1)       │     Traffic Batch Flushes      │        Engine        │
+  │                     │                                │                      │
+  │ - Users & Settings  │                                │ - Heavy WebSockets   │
+  │ - Traffic Auditing  │                                │ - VLESS / Trojan / SS│
+  │ - Idempotent Schema │                                │ - Outbound TCP / DoH │
+  │ - Fail-Closed Auth  │                                │ - Subscription Feeds │
+  └─────────────────────┘                                └──────────┬───────────┘
+                                                                    │
+                                                Cache & IP Lookups  │
+                                                                    ▼
+                                                         ┌──────────────────────┐
+                                                         │       WORKER C       │
+                                                         │  Repository & Cache  │
+                                                         │     (ONLY KV)        │
+                                                         │                      │
+                                                         │ - ips.txt & VIP-list │
+                                                         │ - In-Memory + KV TTL │
+                                                         │ - Fallback Mirrors   │
+                                                         │ - Fail-Closed Auth   │
+                                                         └──────────────────────┘
+```
+
+---
+
+## 1. Service Responsibilities Matrix
+
+| Service | Directory | Responsibilities | Forbidden Operations |
 |---|---|---|---|
-| **Worker A** | `workers/worker-a/` | Gateway, Panel UI, Secret Route Gate, Subscriptions | Environment Variables (`DB_SERVICE_URL`, `CACHE_SERVICE_URL`, `PROXY_SERVICE_URL`, `SECRET_ROUTE_GATE`) |
-| **Worker B** | `workers/worker-b/` | Database Service (CRUD, Traffic Logs, Auth, Auto-reset) | `DB` (D1 Database), Cron Trigger |
-| **Worker C** | `workers/worker-c/` | Repository & File Cache, Clean IP Generator, Ping Tester | `FILE_CACHE_KV` (KV Namespace) |
-| **Worker D** | `workers/worker-d/` | High-Throughput Proxy Handler (VLESS, Trojan, SS, TCP Sockets) | `cloudflare:sockets`, `nodejs_compat` |
+| **Worker A** | `workers/worker-a/` | Management UI, Login/Logout, Cryptographic Sessions, Secret Route Gate, displays subscription URLs, server-side RPC to B/C/D. | **NO** protocol parsing, **NO** proxy sockets/`connect()`, **NO** D1 binding, **NO** GitHub raw fetching, **NO** subscription content generation. |
+| **Worker B** | `workers/worker-b/` | **SOLE** owner of D1 database, user management, quota counters, safe schema migrations, session storage, fail-closed auth. | **NO** proxy traffic handling, **NO** public unauthenticated endpoints (except `/health`). |
+| **Worker C** | `workers/worker-c/` | **SOLE** repository/cache service, KV storage (`FILE_CACHE_KV`), clean IP parsing (`ips.txt`), proxy test offloader, fail-closed auth. | **NO** D1 database access, **NO** proxy connection handling. |
+| **Worker D** | `workers/worker-d/` | **SOLE** connection engine, VLESS / Trojan / Shadowsocks WebSocket streaming, direct TCP sockets (`cloudflare:sockets`), SOCKS5/HTTP chaining, **SOLE** owner of subscription feeds (`/sub/`, `/feed/`, `/yaml/`). | **NO** admin dashboard UI, **NO** direct D1 binding (calls Worker B for users & traffic). |
 
 ---
 
-## 🚀 Step-by-Step Deployment Guide
+## 2. Cloudflare Bindings & Environment Variables
 
-### 1. Deploy Worker B (Database Service - Cloudflare D1)
+### Worker A (`workers/worker-a/wrangler.toml`)
+- **[vars]**:
+  - `SECRET_ROUTE_GATE = "ggg"` (Secret path prefix or query parameter)
+  - `DB_SERVICE_URL = "https://worker-b-db.<YOUR-ACCOUNT>.workers.dev"`
+  - `CACHE_SERVICE_URL = "https://worker-c-cache.<YOUR-ACCOUNT>.workers.dev"`
+  - `PROXY_SERVICE_URL = "https://worker-d-proxy.<YOUR-ACCOUNT>.workers.dev"`
+- **Cloudflare Secrets** (`wrangler secret put`):
+  - `INTERNAL_AUTH_TOKEN`: Shared secret token for inter-worker authentication.
+- **Bindings**: None required (Service bindings `DB_SERVICE`, `CACHE_SERVICE`, `PROXY_SERVICE` optional if deployed in the same account).
 
-Deploy on Account #1 or dedicated database account:
+### Worker B (`workers/worker-b/wrangler.toml`)
+- **Bindings**:
+  - `[[d1_databases]]`: `binding = "DB"`, `database_name = "zeus-db"`, `database_id = "<YOUR_D1_DATABASE_ID>"`
+- **Cloudflare Secrets**:
+  - `INTERNAL_AUTH_TOKEN`: Shared secret token. Must match Worker A and Worker D.
+- **Triggers**:
+  - `crons = ["0 * * * *"]`: Hourly scheduled auto-reset for volume/request quotas.
 
+### Worker C (`workers/worker-c/wrangler.toml`)
+- **Bindings**:
+  - `[[kv_namespaces]]`: `binding = "FILE_CACHE_KV"`, `id = "<YOUR_KV_NAMESPACE_ID>"`
+- **[vars]**:
+  - `UPSTREAM_MIRRORS = "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main,https://fesavswgvswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev"`
+- **Cloudflare Secrets**:
+  - `INTERNAL_AUTH_TOKEN`: Shared secret token.
+
+### Worker D (`workers/worker-d/wrangler.toml`)
+- **[vars]**:
+  - `DB_SERVICE_URL = "https://worker-b-db.<YOUR-ACCOUNT>.workers.dev"`
+  - `CACHE_SERVICE_URL = "https://worker-c-cache.<YOUR-ACCOUNT>.workers.dev"`
+- **Cloudflare Secrets**:
+  - `INTERNAL_AUTH_TOKEN`: Shared secret token.
+- **Compatibility Flags**:
+  - `compatibility_flags = ["nodejs_compat"]`
+
+---
+
+## 3. Safe Database Schema Migration
+
+Worker B features an idempotent migration system. It executes `PRAGMA table_info(users)` and uses `ALTER TABLE users ADD COLUMN ...` only for missing columns.
+It **never** runs `DROP TABLE users` or `DROP TABLE settings`.
+
+If an older database exists containing legacy columns like:
+- `total_gb`: Kept intact and mapped to `limit_gb = COALESCE(limit_gb, total_gb)`.
+- `password`: Kept intact.
+- `expire_at`: Kept intact.
+
+---
+
+## 4. Deployment Instructions
+
+### Step 1: Deploy Worker B (Database Service)
 ```bash
 cd workers/worker-b
-
-# 1. Create the D1 Database
 wrangler d1 create zeus-db
+# Insert the returned database_id into workers/worker-b/wrangler.toml
 
-# 2. Copy the database_id from terminal output and paste into wrangler.toml:
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "zeus-db"
-# database_id = "YOUR_DATABASE_ID_HERE"
-
-# 3. Set the shared secret token
 wrangler secret put INTERNAL_AUTH_TOKEN
-# Enter your random secret token (e.g., a 32-character string)
+# Enter your random 32+ character secret token
 
-# 4. Deploy Worker B
 wrangler deploy
 ```
+Copy Worker B's URL (e.g., `https://worker-b-db.example.workers.dev`).
 
-Note Worker B's URL (e.g. `https://worker-b-db.YOUR-ACCOUNT.workers.dev`).
-
----
-
-### 2. Deploy Worker C (Repository & File Cache - Cloudflare KV)
-
-Deploy on Account #2 or dedicated cache account:
-
+### Step 2: Deploy Worker C (Repository & Cache)
 ```bash
 cd workers/worker-c
-
-# 1. Create the KV Namespace
 wrangler kv:namespace create "FILE_CACHE_KV"
+# Insert the returned namespace id into workers/worker-c/wrangler.toml
 
-# 2. Copy the id from terminal output and paste into wrangler.toml:
-# [[kv_namespaces]]
-# binding = "FILE_CACHE_KV"
-# id = "YOUR_KV_NAMESPACE_ID_HERE"
-
-# 3. Set the shared secret token (same as Worker B)
 wrangler secret put INTERNAL_AUTH_TOKEN
+# Enter the exact same secret token
 
-# 4. Deploy Worker C
 wrangler deploy
 ```
+Copy Worker C's URL (e.g., `https://worker-c-cache.example.workers.dev`).
 
-Note Worker C's URL (e.g. `https://worker-c-cache.YOUR-ACCOUNT.workers.dev`).
-
----
-
-### 3. Deploy Worker D (Connection & Proxy Handler)
-
-Deploy on Account #3 (high compute quota account):
-
+### Step 3: Deploy Worker D (Connection & Proxy Engine)
 ```bash
 cd workers/worker-d
+# Set DB_SERVICE_URL and CACHE_SERVICE_URL in workers/worker-d/wrangler.toml
 
-# 1. Set the shared secret token
 wrangler secret put INTERNAL_AUTH_TOKEN
+# Enter the exact same secret token
 
-# 2. Set Worker B and Worker C URLs in wrangler.toml or via vars:
-# DB_SERVICE_URL = "https://worker-b-db.YOUR-ACCOUNT.workers.dev"
-# CACHE_SERVICE_URL = "https://worker-c-cache.YOUR-ACCOUNT.workers.dev"
-
-# 3. Deploy Worker D
 wrangler deploy
 ```
+Copy Worker D's URL (e.g., `https://worker-d-proxy.example.workers.dev`).
 
-Note Worker D's URL (e.g. `https://worker-d-proxy.YOUR-ACCOUNT.workers.dev`).
-
----
-
-### 4. Deploy Worker A (Main Gateway & Panel)
-
-Deploy on Account #4 (or your primary custom domain):
-
+### Step 4: Deploy Worker A (Management Panel)
 ```bash
 cd workers/worker-a
+# Set DB_SERVICE_URL, CACHE_SERVICE_URL, and PROXY_SERVICE_URL in workers/worker-a/wrangler.toml
 
-# 1. Configure wrangler.toml:
-# SECRET_ROUTE_GATE = "ggg"
-# INTERNAL_AUTH_TOKEN = "YOUR_SHARED_SECRET_TOKEN"
-# DB_SERVICE_URL = "https://worker-b-db.YOUR-ACCOUNT.workers.dev"
-# CACHE_SERVICE_URL = "https://worker-c-cache.YOUR-ACCOUNT.workers.dev"
-# PROXY_SERVICE_URL = "https://worker-d-proxy.YOUR-ACCOUNT.workers.dev"
-
-# 2. Set the secret token
 wrangler secret put INTERNAL_AUTH_TOKEN
+# Enter the exact same secret token
 
-# 3. Deploy Worker A
 wrangler deploy
 ```
 
 ---
 
-## 🔒 Secret Route Gate Usage
+## 5. Security & Session Guarantees
 
-The Secret Route Gate protects your panel from web crawlers, scans, and unauthorized reconnaissance.
-
-- If `SECRET_ROUTE_GATE = "ggg"` is configured:
-  - Visiting `https://your-domain.com/panel` directly returns:
-    ```
-    404 Not Found: Nothing to see here
-    ```
-  - Visiting `https://your-domain.com/ggg/panel` or `https://your-domain.com/panel?gate=ggg` unlocks access and sets a secure `panel_gate` cookie for the session.
-- Public client links (`/sub/:username`, `/feed/:username`, `/yaml/:username`, `/status/:username`) remain operational for proxy clients without exposing the secret gate.
-
----
-
-## ⚙️ Dynamic Configuration in Admin Settings
-
-Inside Worker A's Web Dashboard:
-1. Click **⚙️ تنظیمات ورکرها (Worker Endpoints & Gate Settings)**.
-2. You can dynamically modify:
-   - Worker B Database Endpoint URL
-   - Worker C Cache Endpoint URL
-   - Worker D Proxy Engine Endpoint URL
-   - Secret Route Gate key
-3. Click **تست اتصال ورکرها (Test Endpoints)** to inspect live millisecond latencies to all 3 upstream services.
-4. Changes are saved directly in Worker B's persistent `settings` table without requiring any code redeployments!
+1. **Fail-Closed Policy**: If `INTERNAL_AUTH_TOKEN` is missing or empty, Worker B, C, and D strictly reject internal requests with HTTP 403.
+2. **Timing-Safe Equal**: All internal token checks and password verifications use constant-time character comparisons to prevent timing attacks.
+3. **Session Tokens**: Replaced password hash session cookies with 256-bit cryptographically random tokens stored in D1's `sessions` table. Sent via `HttpOnly`, `Secure`, `SameSite=Lax` cookies.
+4. **Secret Route Gate**: Access to admin routes on Worker A requires the secret path prefix (e.g., `/ggg/panel`) or query parameter (`?gate=ggg`). Unauthorized scanners receive an immediate 404 "Nothing to see here" without consuming D1 reads.
+5. **Authoritative Dynamic Configuration**: Worker A provides a dedicated Admin Settings section to update `db_service_url`, `cache_service_url`, `proxy_service_url`, and `secret_route_gate` dynamically in Worker B's database without code redeployments.

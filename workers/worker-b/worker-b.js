@@ -1,45 +1,58 @@
 /**
  * WORKER B: Database Service (Cloudflare D1)
  * 
- * Responsibilities:
- * - D1 Database operations exclusively (CRUD for users, settings, traffic logs).
- * - Exposes an internal API secured with INTERNAL_AUTH_TOKEN for Worker A and Worker D.
- * - Auto-initializes schema on startup.
- * - Handles auto-reset checks on scheduled cron or internal trigger.
- * - Multi-Account Ready: Can be deployed on a separate Cloudflare Account.
+ * Sole owner of Cloudflare D1 database operations.
+ * Communicates ONLY with Worker A and Worker D via authenticated internal API calls.
+ * 
+ * Security:
+ * - Fails closed if INTERNAL_AUTH_TOKEN is missing or invalid.
+ * - Constant-time comparison for authentication tokens.
+ * - Cryptographically random session management.
+ * - Safe idempotent schema migrations without dropping tables or losing columns.
  */
 
 let schemaEnsured = false;
 let schemaPromise = null;
-let cachedPanelPassword = null;
 
 function safeJson(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Internal-Token"
+      "Cache-Control": "no-store"
     }
   });
 }
 
+function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
 function verifyInternalAuth(request, env) {
-  // Allow if Service Binding call or matching secret token
   const expectedToken = env.INTERNAL_AUTH_TOKEN;
-  if (!expectedToken) return true; // development fallback if not set
+  // FAIL CLOSED: if token is missing, undefined, or empty, deny access immediately
+  if (!expectedToken || typeof expectedToken !== "string" || expectedToken.trim() === "") {
+    return false;
+  }
 
   const authHeader = request.headers.get("Authorization") || "";
   const internalHeader = request.headers.get("X-Internal-Token") || "";
-  
-  if (authHeader.startsWith("Bearer ") && authHeader.slice(7).trim() === expectedToken) {
-    return true;
+
+  let providedToken = "";
+  if (authHeader.startsWith("Bearer ")) {
+    providedToken = authHeader.slice(7).trim();
+  } else if (internalHeader) {
+    providedToken = internalHeader.trim();
   }
-  if (internalHeader.trim() === expectedToken) {
-    return true;
-  }
-  return false;
+
+  if (!providedToken) return false;
+  return timingSafeEqual(providedToken, expectedToken.trim());
 }
 
 async function readJsonBody(request) {
@@ -54,8 +67,13 @@ async function readJsonBody(request) {
 async function sha256(message) {
   const msgBuffer = new TextEncoder().encode(message);
   const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function generateRandomHex(byteCount = 32) {
+  const bytes = new Uint8Array(byteCount);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 function sha224Pure(message) {
@@ -76,10 +94,7 @@ function sha224Pure(message) {
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
   ];
-  let H = [
-    0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939,
-    0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4
-  ];
+  let H = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
   const msgBytes = typeof message === 'string' ? new TextEncoder().encode(message) : message;
   const bitLen = msgBytes.length * 8;
   const newLen = (((msgBytes.length + 8) >> 6) + 1) << 6;
@@ -90,118 +105,137 @@ function sha224Pure(message) {
   view.setUint32(newLen - 4, bitLen, false);
   const W = new Uint32Array(64);
   for (let i = 0; i < newLen; i += 64) {
-    for (let t = 0; t < 16; t++) {
-      W[t] = view.getUint32(i + t * 4, false);
-    }
-    for (let t = 16; t < 64; t++) {
-      W[t] = (gamma1(W[t - 2]) + W[t - 7] + gamma0(W[t - 15]) + W[t - 16]) >>> 0;
-    }
+    for (let t = 0; t < 16; t++) W[t] = view.getUint32(i + t * 4, false);
+    for (let t = 16; t < 64; t++) W[t] = (gamma1(W[t - 2]) + W[t - 7] + gamma0(W[t - 15]) + W[t - 16]) >>> 0;
     let [a, b, c, d, e, f, g, h] = H;
     for (let t = 0; t < 64; t++) {
       const T1 = (h + sigma1(e) + choice(e, f, g) + K[t] + W[t]) >>> 0;
       const T2 = (sigma0(a) + majority(a, b, c)) >>> 0;
-      h = g;
-      g = f;
-      f = e;
-      e = (d + T1) >>> 0;
-      d = c;
-      c = b;
-      b = a;
-      a = (T1 + T2) >>> 0;
+      h = g; g = f; f = e; e = (d + T1) >>> 0; d = c; c = b; b = a; a = (T1 + T2) >>> 0;
     }
-    H[0] = (H[0] + a) >>> 0;
-    H[1] = (H[1] + b) >>> 0;
-    H[2] = (H[2] + c) >>> 0;
-    H[3] = (H[3] + d) >>> 0;
-    H[4] = (H[4] + e) >>> 0;
-    H[5] = (H[5] + f) >>> 0;
-    H[6] = (H[6] + g) >>> 0;
-    H[7] = (H[7] + h) >>> 0;
+    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
   }
   return H.slice(0, 7).map(w => w.toString(16).padStart(8, '0')).join('');
 }
 
+/**
+ * Idempotent, safe migration system.
+ * Never drops tables or columns. Inspects existing tables using PRAGMA table_info.
+ */
 async function ensureSchema(db) {
   if (schemaEnsured) return;
-  if (schemaPromise) {
-    await schemaPromise;
-    return;
-  }
+  if (schemaPromise) { await schemaPromise; return; }
+
   schemaPromise = (async () => {
-    try {
-      await db.prepare(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-        username TEXT UNIQUE, 
-        uuid TEXT, 
-        limit_gb REAL, 
-        expiry_days INTEGER, 
-        ips TEXT, 
-        connection_type TEXT, 
-        tls TEXT, 
-        port INTEGER, 
-        used_gb REAL DEFAULT 0, 
-        is_active INTEGER DEFAULT 1, 
-        last_active INTEGER, 
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )`).run();
-    } catch (e) {}
+    // 1. Ensure primary tables exist
+    await db.prepare(`CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE,
+      uuid TEXT,
+      limit_gb REAL,
+      expiry_days INTEGER,
+      ips TEXT,
+      connection_type TEXT DEFAULT 'vless',
+      tls TEXT DEFAULT 'on',
+      port TEXT DEFAULT '443',
+      used_gb REAL DEFAULT 0,
+      is_active INTEGER DEFAULT 1,
+      last_active INTEGER,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`).run();
 
-    try {
-      await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
-    } catch (e) {}
+    await db.prepare(`CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )`).run();
 
-    try {
-      const { results } = await db.prepare("PRAGMA table_info(users)").all();
-      const existingCols = new Set((results || []).map((r) => r.name));
-      const colsToAdd = [
-        { name: "advanced_frag", def: "TEXT DEFAULT NULL" },
-        { name: "cipher_suites", def: "TEXT DEFAULT NULL" },
-        { name: "tls_mask", def: "TEXT DEFAULT NULL" },
-        { name: "is_active", def: "INTEGER DEFAULT 1" },
-        { name: "last_active", def: "INTEGER" },
-        { name: "fingerprint", def: "TEXT DEFAULT 'chrome'" },
-        { name: "max_connections", def: "INTEGER" },
-        { name: "limit_req", def: "INTEGER" },
-        { name: "used_req", def: "INTEGER DEFAULT 0" },
-        { name: "ip_limit", def: "INTEGER DEFAULT NULL" },
-        { name: "active_ips", def: "TEXT DEFAULT NULL" },
-        { name: "block_porn", def: "INTEGER DEFAULT 0" },
-        { name: "block_ads", def: "INTEGER DEFAULT 0" },
-        { name: "frag_len", def: "TEXT DEFAULT '200-3000'" },
-        { name: "frag_int", def: "TEXT DEFAULT '1-2'" },
-        { name: "lifetime_used_gb", def: "REAL DEFAULT 0" },
-        { name: "user_proxy_ip", def: "TEXT DEFAULT NULL" },
-        { name: "user_proxy_iata", def: "TEXT DEFAULT NULL" },
-        { name: "user_socks5", def: "TEXT DEFAULT NULL" },
-        { name: "auto_reset_vol_days", def: "INTEGER DEFAULT 0" },
-        { name: "auto_reset_req_days", def: "INTEGER DEFAULT 0" },
-        { name: "last_reset_vol_time", def: "INTEGER DEFAULT 0" },
-        { name: "last_reset_req_time", def: "INTEGER DEFAULT 0" },
-        { name: "auto_rotate_ip", def: "INTEGER DEFAULT 1" },
-        { name: "rotate_time", def: "INTEGER DEFAULT 0" },
-        { name: "ip_operator", def: "TEXT DEFAULT 'all'" },
-        { name: "ip_count", def: "INTEGER DEFAULT 15" },
-        { name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
-        { name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
-        { name: "start_on_first_connect", def: "INTEGER DEFAULT 0" },
-        { name: "first_connection_time", def: "INTEGER DEFAULT NULL" },
-        { name: "trojan_hash", def: "TEXT DEFAULT NULL" },
-        { name: "enable_direct", def: "INTEGER DEFAULT 1" },
-      ];
-      for (const col of colsToAdd) {
-        if (!existingCols.has(col.name)) {
-          try {
-            await db.prepare(`ALTER TABLE users ADD COLUMN ${col.name} ${col.def}`).run();
-          } catch (colErr) {}
+    await db.prepare(`CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )`).run();
+
+    // 2. Check existing columns in users table
+    const { results } = await db.prepare("PRAGMA table_info(users)").all();
+    const existingCols = new Set((results || []).map(r => r.name));
+
+    // Full list of columns required by modern ZEUS schema
+    const requiredCols = [
+      { name: "uuid", def: "TEXT DEFAULT NULL" },
+      { name: "limit_gb", def: "REAL DEFAULT NULL" },
+      { name: "expiry_days", def: "INTEGER DEFAULT NULL" },
+      { name: "limit_req", def: "INTEGER DEFAULT NULL" },
+      { name: "used_req", def: "INTEGER DEFAULT 0" },
+      { name: "ips", def: "TEXT DEFAULT NULL" },
+      { name: "connection_type", def: "TEXT DEFAULT 'vless'" },
+      { name: "tls", def: "TEXT DEFAULT 'on'" },
+      { name: "port", def: "TEXT DEFAULT '443'" },
+      { name: "used_gb", def: "REAL DEFAULT 0" },
+      { name: "lifetime_used_gb", def: "REAL DEFAULT 0" },
+      { name: "is_active", def: "INTEGER DEFAULT 1" },
+      { name: "last_active", def: "INTEGER DEFAULT NULL" },
+      { name: "fingerprint", def: "TEXT DEFAULT 'chrome'" },
+      { name: "max_connections", def: "INTEGER DEFAULT NULL" },
+      { name: "ip_limit", def: "INTEGER DEFAULT NULL" },
+      { name: "active_ips", def: "TEXT DEFAULT NULL" },
+      { name: "block_porn", def: "INTEGER DEFAULT 0" },
+      { name: "block_ads", def: "INTEGER DEFAULT 0" },
+      { name: "frag_len", def: "TEXT DEFAULT '200-3000'" },
+      { name: "frag_int", def: "TEXT DEFAULT '1-2'" },
+      { name: "advanced_frag", def: "TEXT DEFAULT NULL" },
+      { name: "cipher_suites", def: "TEXT DEFAULT NULL" },
+      { name: "tls_mask", def: "TEXT DEFAULT NULL" },
+      { name: "user_proxy_iata", def: "TEXT DEFAULT NULL" },
+      { name: "user_socks5", def: "TEXT DEFAULT NULL" },
+      { name: "user_proxy_ip", def: "TEXT DEFAULT NULL" },
+      { name: "auto_reset_vol_days", def: "INTEGER DEFAULT 0" },
+      { name: "auto_reset_req_days", def: "INTEGER DEFAULT 0" },
+      { name: "last_reset_vol_time", def: "INTEGER DEFAULT 0" },
+      { name: "last_reset_req_time", def: "INTEGER DEFAULT 0" },
+      { name: "auto_rotate_ip", def: "INTEGER DEFAULT 1" },
+      { name: "rotate_time", def: "INTEGER DEFAULT 0" },
+      { name: "ip_operator", def: "TEXT DEFAULT 'all'" },
+      { name: "ip_count", def: "INTEGER DEFAULT 15" },
+      { name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
+      { name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
+      { name: "start_on_first_connect", def: "INTEGER DEFAULT 0" },
+      { name: "first_connection_time", def: "INTEGER DEFAULT NULL" },
+      { name: "trojan_hash", def: "TEXT DEFAULT NULL" },
+      { name: "enable_direct", def: "INTEGER DEFAULT 1" },
+    ];
+
+    for (const col of requiredCols) {
+      if (!existingCols.has(col.name)) {
+        try {
+          await db.prepare(`ALTER TABLE users ADD COLUMN ${col.name} ${col.def}`).run();
+        } catch (e) {
+          console.error(`Migration notice: column ${col.name} add failed:`, e.message);
         }
       }
-    } catch (e) {}
+    }
 
-    try {
-      await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
-      await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run();
-    } catch (e) {}
+    // 3. Backward-compatibility data harmonization (preserves older legacy schemas)
+    if (existingCols.has("total_gb")) {
+      await db.prepare("UPDATE users SET limit_gb = total_gb WHERE limit_gb IS NULL AND total_gb IS NOT NULL").run().catch(() => {});
+    }
+    if (existingCols.has("max_connections")) {
+      await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run().catch(() => {});
+    }
+    await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run().catch(() => {});
+
+    // Ensure trojan_hash exists for trojan users
+    const unhashedUsers = await db.prepare("SELECT id, uuid FROM users WHERE trojan_hash IS NULL AND uuid IS NOT NULL").all().catch(() => ({ results: [] }));
+    if (unhashedUsers && unhashedUsers.results) {
+      for (const u of unhashedUsers.results) {
+        if (u.uuid) {
+          const hash = sha224Pure(u.uuid);
+          await db.prepare("UPDATE users SET trojan_hash = ? WHERE id = ?").bind(hash, u.id).run().catch(() => {});
+        }
+      }
+    }
   })();
+
   await schemaPromise;
   schemaEnsured = true;
 }
@@ -211,8 +245,10 @@ async function performAutoResets(db) {
   const todayUtc = Math.floor(now / 86400000) * 86400000;
   try {
     await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_auto_reset_check', ?)").bind(String(now)).run();
-    await db.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
-    await db.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
+    await db.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? 
+      WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
+    await db.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? 
+      WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
     return { success: true, timestamp: now };
   } catch (e) {
     return { success: false, error: e.message };
@@ -227,54 +263,51 @@ export default {
   },
 
   async fetch(request, env, ctx) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Internal-Token"
-        }
+    // 1. Public Health Check
+    const url = new URL(request.url);
+    if (url.pathname === "/health" || url.pathname === "/api/internal/health") {
+      return safeJson({
+        status: "healthy",
+        service: "worker-b-db",
+        timestamp: Date.now()
       });
     }
 
-    if (!env.DB) {
-      return safeJson({ error: "Cloudflare D1 Database binding 'DB' is missing in Worker B." }, 500);
-    }
-
-    // Health check endpoint (can be public or internal)
-    const url = new URL(request.url);
-    if (url.pathname === "/health" || url.pathname === "/api/internal/health") {
-      return safeJson({ status: "healthy", service: "worker-b-db", timestamp: Date.now() });
-    }
-
-    // Authenticate internal caller
+    // 2. Strict Internal Authentication (FAIL CLOSED)
     if (!verifyInternalAuth(request, env)) {
-      return safeJson({ error: "Unauthorized access to Database Service." }, 403);
+      return safeJson({ success: false, error: "Forbidden: Invalid or missing internal authentication token." }, 403);
+    }
+
+    if (!env.DB) {
+      return safeJson({ success: false, error: "Database service binding DB is not configured." }, 500);
     }
 
     await ensureSchema(env.DB);
-
     const path = url.pathname;
 
     try {
-      // 1. GET ALL USERS
+      // ----------------------------------------------------
+      // USER MANAGEMENT ENDPOINTS
+      // ----------------------------------------------------
+
+      // List all users
       if (path === "/api/internal/users" && request.method === "GET") {
         const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
-        
         let deletedGb = 0;
         try {
           const delRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'deleted_users_gb'").first();
           if (delRow) deletedGb = parseFloat(delRow.value) || 0;
-        } catch (e) {}
+        } catch (_) {}
 
         return safeJson({
+          success: true,
           users: results || [],
           serverTime: Date.now(),
           deletedGb
         });
       }
 
-      // 2. CREATE NEW USER
+      // Create new user
       if (path === "/api/internal/users" && request.method === "POST") {
         const body = await readJsonBody(request);
         const {
@@ -286,25 +319,20 @@ export default {
           start_on_first_connect, enable_direct, connection_type, protocols
         } = body;
 
-        if (!username) return safeJson({ error: "Username is required" }, 400);
+        if (!username) return safeJson({ success: false, error: "Username is required" }, 400);
 
         const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
-        if (existing) return safeJson({ error: "User already exists" }, 400);
+        if (existing) return safeJson({ success: false, error: "Username already exists" }, 400);
 
         let finalUuid = uuid;
         if (!finalUuid) {
-          const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(6)))
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join("");
+          const randomHex = generateRandomHex(6);
           finalUuid = `50414e45-4c5f-5a45-5553-${randomHex}`;
         }
 
         let finalConnType = "vless";
-        if (protocols && Array.isArray(protocols) && protocols.length > 0) {
-          finalConnType = protocols.join(",");
-        } else if (connection_type) {
-          finalConnType = connection_type;
-        }
+        if (protocols && Array.isArray(protocols) && protocols.length > 0) finalConnType = protocols.join(",");
+        else if (connection_type) finalConnType = connection_type;
 
         const trojanHash = sha224Pure(finalUuid);
         const todayUtc = Math.floor(Date.now() / 86400000) * 86400000;
@@ -320,7 +348,7 @@ export default {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .bind(
             username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null,
-            limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls, port, fingerprint || "chrome",
+            limit_req ? parseInt(limit_req) : null, ips || null, finalConnType, tls || 'on', port || '443', fingerprint || "chrome",
             ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, parseFloat(used_gb) || 0,
             parseInt(used_req) || 0, created_at || new Date().toISOString(), is_active !== undefined ? parseInt(is_active) : 1,
             block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000",
@@ -335,41 +363,36 @@ export default {
         return safeJson({ success: true, uuid: finalUuid, username });
       }
 
-      // 3. GET SINGLE USER BY USERNAME / UUID / TROJAN_HASH (High-Speed Lookup for Worker D & Subs)
+      // Single User Lookup (Indexed lookup for Worker D & Worker A status)
       if (path.startsWith("/api/internal/user/") && request.method === "GET") {
         const lookupKey = decodeURIComponent(path.slice("/api/internal/user/".length));
-        if (!lookupKey) return safeJson({ error: "Missing lookup key" }, 400);
+        if (!lookupKey) return safeJson({ success: false, error: "Missing lookup key" }, 400);
 
         let user = await env.DB.prepare(
           "SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ? OR trojan_hash = ?"
         ).bind(lookupKey, lookupKey, lookupKey).first();
 
-        // Fallback search by UUID suffix or trojan hash compute
         if (!user && lookupKey.length === 56) {
           const { results } = await env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
           if (results) {
             user = results.find(u => u.uuid && sha224Pure(u.uuid) === lookupKey);
-            if (user) {
-              ctx.waitUntil(env.DB.prepare("UPDATE users SET trojan_hash = ? WHERE id = ?").bind(lookupKey, user.id).run());
-            }
+            if (user) ctx.waitUntil(env.DB.prepare("UPDATE users SET trojan_hash = ? WHERE id = ?").bind(lookupKey, user.id).run());
           }
         } else if (!user && lookupKey.length === 12) {
-          // UUID suffix match
           user = await env.DB.prepare("SELECT * FROM users WHERE uuid LIKE ? AND is_active = 1").bind("%" + lookupKey).first();
         }
 
-        if (!user) return safeJson({ error: "User not found" }, 404);
-        return safeJson({ user });
+        if (!user) return safeJson({ success: false, error: "User not found" }, 404);
+        return safeJson({ success: true, user });
       }
 
-      // 4. UPDATE USER
+      // Update User
       if (path.startsWith("/api/internal/users/") && request.method === "PUT") {
         const targetUsername = decodeURIComponent(path.slice("/api/internal/users/".length));
         const body = await readJsonBody(request);
 
         if (body.toggle_only !== undefined) {
-          await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?")
-            .bind(targetUsername).run();
+          await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(targetUsername).run();
           return safeJson({ success: true });
         }
 
@@ -393,11 +416,8 @@ export default {
         } = body;
 
         let finalConnType = undefined;
-        if (protocols && Array.isArray(protocols) && protocols.length > 0) {
-          finalConnType = protocols.join(",");
-        } else if (connection_type) {
-          finalConnType = connection_type;
-        }
+        if (protocols && Array.isArray(protocols) && protocols.length > 0) finalConnType = protocols.join(",");
+        else if (connection_type) finalConnType = connection_type;
 
         const existingUser = await env.DB.prepare("SELECT uuid FROM users WHERE username = ?").bind(targetUsername).first();
         const trojanHash = existingUser && existingUser.uuid ? sha224Pure(existingUser.uuid) : null;
@@ -430,7 +450,7 @@ export default {
         return safeJson({ success: true });
       }
 
-      // 5. DELETE USER
+      // Delete User
       if (path.startsWith("/api/internal/users/") && request.method === "DELETE") {
         const targetUsername = decodeURIComponent(path.slice("/api/internal/users/".length));
         try {
@@ -441,35 +461,38 @@ export default {
               await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('deleted_users_gb', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS REAL) + ?").bind(String(gbToKeep), String(gbToKeep)).run();
             }
           }
-        } catch (e) {}
+        } catch (_) {}
 
         await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(targetUsername).run();
         return safeJson({ success: true });
       }
 
-      // 6. TRAFFIC FLUSH (Called by Worker A or Worker D)
+      // ----------------------------------------------------
+      // TRAFFIC FLUSH & RECORDING (from Worker D)
+      // ----------------------------------------------------
       if (path === "/api/internal/traffic/flush" && request.method === "POST") {
-        const body = await readJsonBody(request);
-        const { updates } = body; // Array of { username, deltaGb, deltaReq, activeIps, timestamp }
+        const { updates } = await readJsonBody(request);
         if (Array.isArray(updates)) {
           for (const item of updates) {
             const { username, deltaGb = 0, deltaReq = 0, activeIps, timestamp = Date.now() } = item;
-            if (!username) continue;
-            try {
-              if (activeIps) {
-                await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ?, active_ips = ? WHERE username = ?")
-                  .bind(deltaGb, deltaGb, deltaReq, timestamp, activeIps, username).run();
-              } else {
-                await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?")
-                  .bind(deltaGb, deltaGb, deltaReq, timestamp, username).run();
+            if (username) {
+              try {
+                if (activeIps) {
+                  await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ?, active_ips = ? WHERE username = ?")
+                    .bind(deltaGb, deltaGb, deltaReq, timestamp, activeIps, username).run();
+                } else {
+                  await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?")
+                    .bind(deltaGb, deltaGb, deltaReq, timestamp, username).run();
+                }
+              } catch (err) {
+                console.error("Traffic flush failed for user", username, err.message);
               }
-            } catch (err) {}
+            }
           }
         }
         return safeJson({ success: true });
       }
 
-      // 7. RECORD FIRST CONNECTION TIME
       if (path === "/api/internal/traffic/first-connect" && request.method === "POST") {
         const { uuid, timestamp = Date.now() } = await readJsonBody(request);
         if (uuid) {
@@ -479,81 +502,104 @@ export default {
         return safeJson({ success: true });
       }
 
-      // 8. SETTINGS CRUD
+      // ----------------------------------------------------
+      // SETTINGS CRUD
+      // ----------------------------------------------------
       if (path === "/api/internal/settings" && request.method === "GET") {
         const { results } = await env.DB.prepare("SELECT * FROM settings").all();
         const settingsObj = {};
         if (results) {
-          results.forEach((r) => {
-            if (r.key !== "cf_token" && r.key !== "panel_password") settingsObj[r.key] = r.value;
+          results.forEach(r => {
+            if (r.key !== "panel_password") settingsObj[r.key] = r.value;
           });
         }
-        return safeJson({ settings: settingsObj });
+        return safeJson({ success: true, settings: settingsObj });
       }
 
       if (path === "/api/internal/settings" && request.method === "POST") {
-        const body = await readJsonBody(request);
-        if (body.settings && typeof body.settings === "object") {
-          for (const [k, v] of Object.entries(body.settings)) {
+        const { settings } = await readJsonBody(request);
+        if (settings && typeof settings === "object") {
+          for (const [k, v] of Object.entries(settings)) {
             await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
           }
         }
         return safeJson({ success: true });
       }
 
-      // 9. AUTH VERIFICATION & PASSWORD MANAGEMENT
+      // ----------------------------------------------------
+      // AUTH & CRYPTOGRAPHIC SESSION MANAGEMENT
+      // ----------------------------------------------------
       if (path === "/api/internal/auth/has-password" && request.method === "GET") {
         const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
-        return safeJson({ hasPassword: Boolean(row && row.value) });
-      }
-
-      if (path === "/api/internal/auth/verify-password" && request.method === "POST") {
-        const { password } = await readJsonBody(request);
-        const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
-        if (!row || !row.value) return safeJson({ success: true, isSetup: false }); // No password set yet
-
-        const hashed = await sha256(password || "");
-        if (row.value === hashed) {
-          return safeJson({ success: true, hash: hashed });
-        }
-        return safeJson({ success: false, error: "Invalid password" }, 401);
-      }
-
-      if (path === "/api/internal/auth/verify-session" && request.method === "POST") {
-        const { sessionHash } = await readJsonBody(request);
-        const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
-        if (!row || !row.value) return safeJson({ valid: true }); // No password protection active
-        return safeJson({ valid: row.value === sessionHash });
+        return safeJson({ success: true, hasPassword: Boolean(row && row.value) });
       }
 
       if (path === "/api/internal/auth/set-password" && request.method === "POST") {
         const { password } = await readJsonBody(request);
         if (!password || password.length < 4) {
-          return safeJson({ error: "Password must be at least 4 characters" }, 400);
+          return safeJson({ success: false, error: "Password must be at least 4 characters." }, 400);
         }
         const hashed = await sha256(password);
         await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(hashed).run();
-        return safeJson({ success: true, hash: hashed });
+        
+        // Invalidate old sessions upon password change
+        await env.DB.prepare("DELETE FROM sessions").run().catch(() => {});
+
+        // Create new cryptographically random session
+        const sessionToken = generateRandomHex(32);
+        const expiresAt = Date.now() + (7 * 24 * 60 * 60 * 1000); // 7 days
+        await env.DB.prepare("INSERT INTO sessions (id, expires_at, created_at) VALUES (?, ?, ?)").bind(sessionToken, expiresAt, Date.now()).run();
+
+        return safeJson({ success: true, sessionToken, expiresAt });
       }
 
-      if (path === "/api/internal/auth/remove-password" && request.method === "POST") {
-        await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
+      if (path === "/api/internal/auth/verify-password" && request.method === "POST") {
+        const { password } = await readJsonBody(request);
+        const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
+        if (!row || !row.value) return safeJson({ success: true, isSetup: false });
+
+        const hashed = await sha256(password || "");
+        if (timingSafeEqual(row.value, hashed)) {
+          // Generate new cryptographically random session token
+          const sessionToken = generateRandomHex(32);
+          const expiresAt = Date.now() + (7 * 24 * 60 * 60 * 1000); // 7 days
+          await env.DB.prepare("INSERT INTO sessions (id, expires_at, created_at) VALUES (?, ?, ?)").bind(sessionToken, expiresAt, Date.now()).run();
+          return safeJson({ success: true, sessionToken, expiresAt });
+        }
+        return safeJson({ success: false, error: "Incorrect password." }, 401);
+      }
+
+      if (path === "/api/internal/auth/verify-session" && request.method === "POST") {
+        const { sessionToken } = await readJsonBody(request);
+        if (!sessionToken || typeof sessionToken !== "string") return safeJson({ valid: false });
+
+        const now = Date.now();
+        const session = await env.DB.prepare("SELECT * FROM sessions WHERE id = ?").bind(sessionToken).first();
+        if (session && session.expires_at > now) {
+          return safeJson({ valid: true });
+        }
+
+        // Clean expired sessions opportunistically
+        ctx.waitUntil(env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?").bind(now).run());
+        return safeJson({ valid: false });
+      }
+
+      if (path === "/api/internal/auth/destroy-session" && request.method === "POST") {
+        const { sessionToken } = await readJsonBody(request);
+        if (sessionToken) {
+          await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionToken).run();
+        }
         return safeJson({ success: true });
       }
 
-      // 10. MANUAL TRIGGER FOR AUTO-RESET
       if (path === "/api/internal/maintenance/auto-reset" && request.method === "POST") {
         const res = await performAutoResets(env.DB);
         return safeJson(res);
       }
 
-      return safeJson({ error: "Not Found in Database Service" }, 404);
+      return safeJson({ success: false, error: "Not Found in Database Service" }, 404);
     } catch (err) {
-      let msg = err.message || "";
-      if (msg.toLowerCase().includes("d1") && (msg.toLowerCase().includes("limit") || msg.toLowerCase().includes("exceeded"))) {
-        return safeJson({ error: "D1 Database daily quota exceeded" }, 503);
-      }
-      return safeJson({ error: "Database Service error: " + msg }, 500);
+      return safeJson({ success: false, error: "Database Service error: " + err.message }, 500);
     }
   }
 };

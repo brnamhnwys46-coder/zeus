@@ -3,19 +3,19 @@ main = "worker-a.js"
 compatibility_date = "2026-07-10"
 compatibility_flags = ["nodejs_compat"]
 
+# Do not put sensitive secrets in [vars].
+# Configure INTERNAL_AUTH_TOKEN using Cloudflare Secrets:
+#   wrangler secret put INTERNAL_AUTH_TOKEN
 [vars]
-# Secret Route Gate: Must match path prefix or query parameter to access the panel
-# Example: If set to "ggg", panel is accessible via /ggg/panel or ?gate=ggg
+ENVIRONMENT = "production"
+
+# Secret Route Gate: If set (e.g. "ggg"), panel is accessible via /ggg/panel or ?gate=ggg
 SECRET_ROUTE_GATE = "ggg"
 
-# Shared internal token for authenticating with Worker B, C, and D
-INTERNAL_AUTH_TOKEN = "zeus-secret-inter-worker-token-change-me"
-
-# Endpoints for Worker B (Database), Worker C (Cache), and Worker D (Proxy)
-# Can be on separate Cloudflare Accounts
-DB_SERVICE_URL = "https://worker-b-db.YOUR-ACCOUNT.workers.dev"
-CACHE_SERVICE_URL = "https://worker-c-cache.YOUR-ACCOUNT.workers.dev"
-PROXY_SERVICE_URL = "https://worker-d-proxy.YOUR-ACCOUNT.workers.dev"
+# Initial bootstrap endpoints for Worker B, C, and D (Can be overridden dynamically in Admin Settings)
+DB_SERVICE_URL = "https://worker-b-db.<YOUR-ACCOUNT>.workers.dev"
+CACHE_SERVICE_URL = "https://worker-c-cache.<YOUR-ACCOUNT>.workers.dev"
+PROXY_SERVICE_URL = "https://worker-d-proxy.<YOUR-ACCOUNT>.workers.dev"
 
 # Optional: If deployed within the SAME Cloudflare account, you can also use Service Bindings:
 # [[services]]

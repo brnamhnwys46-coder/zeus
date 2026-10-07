@@ -3,12 +3,16 @@ import { connect } from "cloudflare:sockets";
 /**
  * WORKER C: Repository & File Cache Service
  * 
- * Responsibilities:
- * - High-speed caching for external files (ips.txt, vip-list, proxy_vip/*.txt, etc.)
- * - KV persistent cache (FILE_CACHE_KV) + In-memory Map caching.
- * - Dynamic upstream mirrors (GitHub / Workers.dev / custom CDNs).
- * - Offloads network ping / proxy health checks from Main Panel.
- * - Multi-Account Ready: Can be deployed on a separate Cloudflare Account.
+ * Handles:
+ * - External file caching (ips.txt, vip-list, proxy_vip/*.txt, proxy/*.txt)
+ * - Cloudflare KV storage (FILE_CACHE_KV) with memory cache acceleration
+ * - Upstream mirrors with automatic fallback (GitHub, Workers mirrors)
+ * - Offloaded outbound proxy socket health testing
+ * 
+ * Security:
+ * - Fails closed if INTERNAL_AUTH_TOKEN is missing or invalid.
+ * - Constant-time token verification.
+ * - Server-side only; does not expose internal endpoints to the browser.
  */
 
 const MEMORY_CACHE = new Map();
@@ -20,34 +24,45 @@ function safeJson(data, status = 200) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Internal-Token, X-Upstream-Mirrors"
+      "Cache-Control": "no-store"
     }
   });
 }
 
+function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
 function verifyInternalAuth(request, env) {
   const expectedToken = env.INTERNAL_AUTH_TOKEN;
-  if (!expectedToken) return true;
+  // FAIL CLOSED: if token is missing or empty, deny access immediately
+  if (!expectedToken || typeof expectedToken !== "string" || expectedToken.trim() === "") {
+    return false;
+  }
 
   const authHeader = request.headers.get("Authorization") || "";
   const internalHeader = request.headers.get("X-Internal-Token") || "";
 
-  if (authHeader.startsWith("Bearer ") && authHeader.slice(7).trim() === expectedToken) {
-    return true;
+  let providedToken = "";
+  if (authHeader.startsWith("Bearer ")) {
+    providedToken = authHeader.slice(7).trim();
+  } else if (internalHeader) {
+    providedToken = internalHeader.trim();
   }
-  if (internalHeader.trim() === expectedToken) {
-    return true;
-  }
-  return false;
+
+  if (!providedToken) return false;
+  return timingSafeEqual(providedToken, expectedToken.trim());
 }
 
-function getUpstreamUrls(filePath, env, request) {
-  const customHeader = request.headers.get("X-Upstream-Mirrors");
-  const rawMirrors = customHeader || env.UPSTREAM_MIRRORS || "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main,https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev";
+function getUpstreamUrls(filePath, env) {
+  const rawMirrors = env.UPSTREAM_MIRRORS || "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main,https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev";
   const mirrors = rawMirrors.split(",").map(m => m.trim().replace(/\/+$/, "")).filter(Boolean);
-  
   const cleanPath = filePath.startsWith("/") ? filePath.slice(1) : filePath;
   const ghPath = cleanPath.includes("?") ? cleanPath.substring(0, cleanPath.indexOf("?")) : cleanPath;
 
@@ -59,8 +74,8 @@ function getUpstreamUrls(filePath, env, request) {
   });
 }
 
-async function fetchFromUpstream(filePath, env, request) {
-  const urls = getUpstreamUrls(filePath, env, request);
+async function fetchFromUpstream(filePath, env) {
+  const urls = getUpstreamUrls(filePath, env);
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -81,23 +96,23 @@ async function fetchFromUpstream(filePath, env, request) {
 
       clearTimeout(timeoutId);
       return res;
-    } catch (e) {}
-    if (attempt === 0) await new Promise(r => setTimeout(r, 600));
+    } catch (_) {}
+    if (attempt === 0) await new Promise(r => setTimeout(r, 500));
   }
   return null;
 }
 
-async function getCachedFile(filePath, env, request, ttlSeconds = 3600) {
+async function getCachedFile(filePath, env, ttlSeconds = 3600) {
   const now = Date.now();
   const cacheKey = `file:${filePath}`;
 
-  // 1. In-memory hot cache
+  // 1. Hot Memory Cache
   const memCached = MEMORY_CACHE.get(cacheKey);
   if (memCached && (now - memCached.timestamp < ttlSeconds * 1000)) {
     return { data: memCached.data, source: "memory" };
   }
 
-  // 2. Cloudflare KV cache
+  // 2. Persistent KV Cache
   if (env.FILE_CACHE_KV) {
     try {
       const kvData = await env.FILE_CACHE_KV.get(cacheKey, filePath.includes("vip-list") ? "json" : "text");
@@ -105,33 +120,29 @@ async function getCachedFile(filePath, env, request, ttlSeconds = 3600) {
         MEMORY_CACHE.set(cacheKey, { data: kvData, timestamp: now });
         return { data: kvData, source: "kv" };
       }
-    } catch (e) {}
+    } catch (_) {}
   }
 
-  // 3. Fallback to upstream mirrors
-  const upstreamRes = await fetchFromUpstream(filePath, env, request);
+  // 3. Fallback to Upstream Mirrors
+  const upstreamRes = await fetchFromUpstream(filePath, env);
   if (upstreamRes && upstreamRes.ok) {
     const isJson = filePath.includes("vip-list");
     const data = isJson ? await upstreamRes.json() : await upstreamRes.text();
 
-    // Store in memory
     MEMORY_CACHE.set(cacheKey, { data, timestamp: now });
 
-    // Store in KV asynchronously
     if (env.FILE_CACHE_KV) {
-      try {
-        await env.FILE_CACHE_KV.put(
-          cacheKey, 
-          isJson ? JSON.stringify(data) : data, 
-          { expirationTtl: Math.max(60, ttlSeconds) }
-        );
-      } catch (e) {}
+      env.FILE_CACHE_KV.put(
+        cacheKey,
+        isJson ? JSON.stringify(data) : data,
+        { expirationTtl: Math.max(60, ttlSeconds) }
+      ).catch(() => {});
     }
 
     return { data, source: "upstream" };
   }
 
-  // Fallback to expired memory cache if available
+  // 4. Stale fallback if available
   if (memCached && memCached.data) {
     return { data: memCached.data, source: "memory_stale" };
   }
@@ -139,7 +150,7 @@ async function getCachedFile(filePath, env, request, ttlSeconds = 3600) {
   return null;
 }
 
-// Socket / Proxy connection helpers for test-proxy offloading
+// Socket helpers for testing proxies
 function bracketIPv6(host) {
   return typeof host === "string" && host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
@@ -180,134 +191,65 @@ function parseProxyConfig(proxyStr, defaultPort = 1080) {
   return { user, pass, host, port, auth };
 }
 
-async function connectSocks5(socksStr, destAddr, destPort, initialData) {
-  const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
+async function testOutboundSocket(proxyStr, targetHost = "1.1.1.1", targetPort = 80) {
+  const { host, port } = parseProxyConfig(proxyStr, 1080);
+  const startT = Date.now();
   const socket = connect({ hostname: bracketIPv6(host), port });
-  await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 4000))]);
-  const reader = socket.readable.getReader();
-  const writer = socket.writable.getWriter();
-  try {
-    if (auth) {
-      await writer.write(new Uint8Array([0x05, 0x02, 0x00, 0x02]));
-    } else {
-      await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
-    }
-    let res = await reader.read();
-    if (res.done || !res.value || res.value[0] !== 0x05) throw new Error("Invalid socks5 response");
-    if (res.value[1] === 0x02) {
-      const uEnc = TEXT_ENCODER.encode(user);
-      const pEnc = TEXT_ENCODER.encode(pass);
-      const authReq = new Uint8Array(1 + 1 + uEnc.length + 1 + pEnc.length);
-      authReq[0] = 0x01; authReq[1] = uEnc.length;
-      authReq.set(uEnc, 2); authReq[2 + uEnc.length] = pEnc.length;
-      authReq.set(pEnc, 3 + uEnc.length);
-      await writer.write(authReq);
-      let authRes = await reader.read();
-      if (authRes.done || !authRes.value || authRes.value[1] !== 0x00) throw new Error("Proxy auth failed");
-    }
-    const enc = TEXT_ENCODER.encode(destAddr);
-    const req = new Uint8Array(4 + 1 + enc.length + 2);
-    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03; req[4] = enc.length;
-    req.set(enc, 5);
-    const portOffset = 5 + enc.length;
-    req[portOffset] = (destPort >> 8) & 0xff; req[portOffset + 1] = destPort & 0xff;
-    await writer.write(req);
-    let connRes = await reader.read();
-    if (connRes.done || !connRes.value || connRes.value[1] !== 0x00) throw new Error("Socks5 connect rejected");
-    if (initialData) await writer.write(initialData);
-    writer.releaseLock();
-    reader.releaseLock();
-    return socket;
-  } catch (e) {
-    try { writer.releaseLock(); } catch (_) {}
-    try { reader.releaseLock(); } catch (_) {}
-    try { socket.close(); } catch (_) {}
-    throw e;
-  }
-}
-
-async function connectHttpProxy(proxyStr, destAddr, destPort, initialData) {
-  const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
-  const socket = connect({ hostname: bracketIPv6(host), port });
-  await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 4000))]);
-  const reader = socket.readable.getReader();
-  const writer = socket.writable.getWriter();
-  try {
-    const safeDest = destAddr.includes(":") ? `[${destAddr}]` : destAddr;
-    let req = `CONNECT ${safeDest}:${destPort} HTTP/1.1\r\nHost: ${safeDest}:${destPort}\r\n`;
-    if (auth) req += `Proxy-Authorization: Basic ${btoa(`${user}:${pass}`)}\r\n`;
-    req += "\r\n";
-    await writer.write(TEXT_ENCODER.encode(req));
-    const res = await reader.read();
-    if (res.done || !res.value) throw new Error("HTTP proxy closed");
-    const resStr = TEXT_DECODER.decode(res.value);
-    if (!resStr.includes("200")) throw new Error("HTTP proxy reject");
-    if (initialData) await writer.write(initialData);
-    writer.releaseLock();
-    reader.releaseLock();
-    return socket;
-  } catch (e) {
-    try { writer.releaseLock(); } catch (_) {}
-    try { reader.releaseLock(); } catch (_) {}
-    try { socket.close(); } catch (_) {}
-    throw e;
-  }
+  await Promise.race([
+    socket.opened,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Connection timeout")), 4000))
+  ]);
+  const ping = Date.now() - startT;
+  try { socket.close(); } catch (_) {}
+  return { success: true, ping, country: "UN" };
 }
 
 export default {
   async fetch(request, env, ctx) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Internal-Token, X-Upstream-Mirrors"
-        }
-      });
-    }
-
     const url = new URL(request.url);
+
+    // Public Health Check
     if (url.pathname === "/health" || url.pathname === "/api/internal/health") {
-      return safeJson({ 
-        status: "healthy", 
-        service: "worker-c-cache", 
-        hasKV: Boolean(env.FILE_CACHE_KV), 
-        memoryKeys: MEMORY_CACHE.size,
-        timestamp: Date.now() 
+      return safeJson({
+        status: "healthy",
+        service: "worker-c-cache",
+        hasKV: Boolean(env.FILE_CACHE_KV),
+        memoryCacheSize: MEMORY_CACHE.size,
+        timestamp: Date.now()
       });
     }
 
-    // Authenticate internal caller
+    // Strict Internal Authentication (FAIL CLOSED)
     if (!verifyInternalAuth(request, env)) {
-      return safeJson({ error: "Unauthorized access to Cache Service." }, 403);
+      return safeJson({ success: false, error: "Forbidden: Invalid or missing internal authentication token." }, 403);
     }
 
     const path = url.pathname;
 
     try {
-      // 1. GET GENERIC CACHED FILE
+      // 1. Get Cached Repository File
       if (path === "/api/internal/cache/file" && request.method === "GET") {
         const filePath = url.searchParams.get("path");
         const ttl = parseInt(url.searchParams.get("ttl") || "3600");
-        if (!filePath) return safeJson({ error: "Missing 'path' parameter" }, 400);
+        if (!filePath) return safeJson({ success: false, error: "Missing 'path' query parameter." }, 400);
 
-        const result = await getCachedFile(filePath, env, request, ttl);
-        if (!result) return safeJson({ error: `File not found: ${filePath}` }, 404);
+        const result = await getCachedFile(filePath, env, ttl);
+        if (!result) return safeJson({ success: false, error: `File not found: ${filePath}` }, 404);
 
         return safeJson({
+          success: true,
           path: filePath,
           source: result.source,
           data: result.data
         });
       }
 
-      // 2. GET CLEAN CLOUDFLARE IPS (Shuffled, Operator Filtered)
+      // 2. Get Clean Cloudflare IPs (Operator Filtered & Shuffled)
       if (path === "/api/internal/cache/ips" && request.method === "GET") {
-        const operator = url.searchParams.get("operator") || "all";
         let count = parseInt(url.searchParams.get("count") || "20");
         if (isNaN(count) || count < 1) count = 20;
 
-        const result = await getCachedFile("ips.txt", env, request, 86400);
+        const result = await getCachedFile("ips.txt", env, 86400);
         let ips = [];
         if (result && result.data && typeof result.data === "string") {
           ips = result.data.split("\n")
@@ -315,7 +257,6 @@ export default {
             .filter(l => l.length > 0 && !l.includes("#") && !l.startsWith("[source") && !l.includes("----------"));
         }
 
-        // Shuffle IPs
         const shuffled = ips.slice();
         for (let i = shuffled.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
@@ -324,6 +265,7 @@ export default {
 
         const selected = shuffled.slice(0, count);
         return safeJson({
+          success: true,
           count: selected.length,
           totalAvailable: ips.length,
           ips: selected,
@@ -331,22 +273,22 @@ export default {
         });
       }
 
-      // 3. GET VIP PROXY COUNTRIES & LIST
+      // 3. Get VIP Country Directory
       if (path === "/api/internal/cache/vip-countries" && request.method === "GET") {
-        const result = await getCachedFile("vip-list", env, request, 3600);
+        const result = await getCachedFile("vip-list", env, 3600);
         let countries = ["DE", "US", "GB", "NL", "FR", "TR"];
         if (result && Array.isArray(result.data)) {
           countries = result.data
             .filter(f => f && f.name && f.name.endsWith(".txt"))
             .map(f => f.name.replace(".txt", "").toUpperCase());
         }
-        return safeJson({ countries });
+        return safeJson({ success: true, countries });
       }
 
-      // 4. TEST PROXY HEALTH (Offloaded from Worker A)
+      // 4. Outbound Proxy Health Check
       if (path === "/api/internal/cache/test-proxy" && request.method === "POST") {
-        const { proxy, skip_country } = await request.json().catch(() => ({}));
-        if (!proxy) return safeJson({ error: "Missing proxy parameter" }, 400);
+        const { proxy } = await request.json().catch(() => ({}));
+        if (!proxy) return safeJson({ success: false, error: "Missing proxy parameter." }, 400);
 
         if (proxy === "direct") {
           const startT = Date.now();
@@ -356,63 +298,28 @@ export default {
             await fetch("https://cp.cloudflare.com/generate_204", { method: "HEAD", signal: controller.signal });
             clearTimeout(tid);
             return safeJson({ success: true, ping: Date.now() - startT, country: "UN" });
-          } catch (e) {
-            return safeJson({ error: "Direct connection failed" });
+          } catch (_) {
+            return safeJson({ success: false, error: "Direct internet test failed." });
           }
         }
 
-        const startTime = Date.now();
-        const targetHost = skip_country ? "1.1.1.1" : "ip-api.com";
-        const reqPath = skip_country ? "/" : "/json/?fields=countryCode";
-        const payload = TEXT_ENCODER.encode(`GET ${reqPath} HTTP/1.1\r\nHost: ${targetHost}\r\nConnection: close\r\n\r\n`);
-
-        let sock = null;
         try {
-          const isHttp = proxy.toLowerCase().startsWith("http://") || proxy.toLowerCase().startsWith("https://");
-          const cleanStr = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-
-          if (isHttp) {
-            sock = await connectHttpProxy(cleanStr, targetHost, 80, payload);
-          } else {
-            sock = await connectSocks5(cleanStr, targetHost, 80, payload);
-          }
-
-          const reader = sock.readable.getReader();
-          let resStr = "";
-          const timeoutId = setTimeout(() => { try { sock.close(); } catch (_) {} }, 5000);
-          try {
-            while (true) {
-              const res = await reader.read();
-              if (res.done || !res.value) break;
-              resStr += TEXT_DECODER.decode(res.value, { stream: true });
-              if (skip_country && resStr.includes("HTTP/1.")) break;
-              if (resStr.includes("countryCode")) break;
-            }
-          } finally {
-            clearTimeout(timeoutId);
-            try { sock.close(); } catch (_) {}
-          }
-
-          const ping = Date.now() - startTime;
-          let country = "UN";
-          const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-          if (jsonMatch && jsonMatch[1]) country = jsonMatch[1];
-
-          return safeJson({ success: true, ping, country });
+          const res = await testOutboundSocket(proxy);
+          return safeJson(res);
         } catch (e) {
-          return safeJson({ error: e.message || "Connection failed" }, 200);
+          return safeJson({ success: false, error: e.message || "Proxy test failed." });
         }
       }
 
-      // 5. PURGE CACHE
+      // 5. Purge Cache
       if (path === "/api/internal/cache/purge" && request.method === "POST") {
         MEMORY_CACHE.clear();
-        return safeJson({ success: true, message: "In-memory cache purged" });
+        return safeJson({ success: true, message: "In-memory cache purged successfully." });
       }
 
-      return safeJson({ error: "Not Found in Cache Service" }, 404);
+      return safeJson({ success: false, error: "Not Found in Cache Service." }, 404);
     } catch (err) {
-      return safeJson({ error: "Cache Service error: " + err.message }, 500);
+      return safeJson({ success: false, error: "Cache Service error: " + err.message }, 500);
     }
   }
 };

@@ -3,13 +3,13 @@ main = "worker-c.js"
 compatibility_date = "2026-07-10"
 compatibility_flags = ["nodejs_compat"]
 
+# Do not put sensitive secrets in [vars].
+# Configure INTERNAL_AUTH_TOKEN using Cloudflare Secrets:
+#   wrangler secret put INTERNAL_AUTH_TOKEN
 [vars]
-# Secret token shared with Worker A and Worker D
-INTERNAL_AUTH_TOKEN = "zeus-secret-inter-worker-token-change-me"
-
-# Comma-separated list of fallback repository mirrors
+ENVIRONMENT = "production"
 UPSTREAM_MIRRORS = "https://raw.githubusercontent.com/panel-zeus/Z-E-U-S/refs/heads/main,https://fesavswgvswgfvasw.hxxyrukih4kvmeawzmdmug2eh5uwtcmt.workers.dev"
 
 [[kv_namespaces]]
 binding = "FILE_CACHE_KV"
-id = "YOUR_KV_NAMESPACE_ID"
+id = "<YOUR_KV_NAMESPACE_ID>"
